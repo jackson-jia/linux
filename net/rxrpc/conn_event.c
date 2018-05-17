@@ -30,22 +30,18 @@ static void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
 	struct rxrpc_skb_priv *sp = skb ? rxrpc_skb(skb) : NULL;
 	struct rxrpc_channel *chan;
 	struct msghdr msg;
-	struct kvec iov;
+	struct kvec iov[3];
 	struct {
 		struct rxrpc_wire_header whdr;
 		union {
-			struct {
-				__be32 code;
-			} abort;
-			struct {
-				struct rxrpc_ackpacket ack;
-				u8 padding[3];
-				struct rxrpc_ackinfo info;
-			};
+			__be32 abort_code;
+			struct rxrpc_ackpacket ack;
 		};
 	} __attribute__((packed)) pkt;
+	struct rxrpc_ackinfo ack_info;
 	size_t len;
-	u32 serial, mtu, call_id;
+	int ioc;
+	u32 serial, mtu, call_id, padding;
 
 	_enter("%d", conn->debug_id);
 
@@ -66,6 +62,13 @@ static void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
 	msg.msg_controllen = 0;
 	msg.msg_flags	= 0;
 
+	iov[0].iov_base	= &pkt;
+	iov[0].iov_len	= sizeof(pkt.whdr);
+	iov[1].iov_base	= &padding;
+	iov[1].iov_len	= 3;
+	iov[2].iov_base	= &ack_info;
+	iov[2].iov_len	= sizeof(ack_info);
+
 	pkt.whdr.epoch		= htonl(conn->proto.epoch);
 	pkt.whdr.cid		= htonl(conn->proto.cid);
 	pkt.whdr.callNumber	= htonl(call_id);
@@ -80,8 +83,10 @@ static void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
 	len = sizeof(pkt.whdr);
 	switch (chan->last_type) {
 	case RXRPC_PACKET_TYPE_ABORT:
-		pkt.abort.code	= htonl(chan->last_abort);
-		len += sizeof(pkt.abort);
+		pkt.abort_code	= htonl(chan->last_abort);
+		iov[0].iov_len += sizeof(pkt.abort_code);
+		len += sizeof(pkt.abort_code);
+		ioc = 1;
 		break;
 
 	case RXRPC_PACKET_TYPE_ACK:
@@ -94,13 +99,19 @@ static void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
 		pkt.ack.serial		= htonl(skb ? sp->hdr.serial : 0);
 		pkt.ack.reason		= skb ? RXRPC_ACK_DUPLICATE : RXRPC_ACK_IDLE;
 		pkt.ack.nAcks		= 0;
-		pkt.info.rxMTU		= htonl(rxrpc_rx_mtu);
-		pkt.info.maxMTU		= htonl(mtu);
-		pkt.info.rwind		= htonl(rxrpc_rx_window_size);
-		pkt.info.jumbo_max	= htonl(rxrpc_rx_jumbo_max);
+		ack_info.rxMTU		= htonl(rxrpc_rx_mtu);
+		ack_info.maxMTU		= htonl(mtu);
+		ack_info.rwind		= htonl(rxrpc_rx_window_size);
+		ack_info.jumbo_max	= htonl(rxrpc_rx_jumbo_max);
 		pkt.whdr.flags		|= RXRPC_SLOW_START_OK;
-		len += sizeof(pkt.ack) + sizeof(pkt.info);
+		padding			= 0;
+		iov[0].iov_len += sizeof(pkt.ack);
+		len += sizeof(pkt.ack) + 3 + sizeof(ack_info);
+		ioc = 3;
 		break;
+
+	default:
+		return;
 	}
 
 	/* Resync with __rxrpc_disconnect_call() and check that the last call
@@ -109,9 +120,6 @@ static void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
 	smp_rmb();
 	if (READ_ONCE(chan->last_call) != call_id)
 		return;
-
-	iov.iov_base	= &pkt;
-	iov.iov_len	= len;
 
 	serial = atomic_inc_return(&conn->serial);
 	pkt.whdr.serial = htonl(serial);
@@ -127,7 +135,8 @@ static void rxrpc_conn_retransmit_call(struct rxrpc_connection *conn,
 		break;
 	}
 
-	kernel_sendmsg(conn->params.local->socket, &msg, &iov, 1, len);
+	kernel_sendmsg(conn->params.local->socket, &msg, iov, ioc, len);
+	conn->params.peer->last_tx_at = ktime_get_real();
 	_leave("");
 	return;
 }
@@ -152,7 +161,8 @@ static void rxrpc_abort_calls(struct rxrpc_connection *conn,
 			lockdep_is_held(&conn->channel_lock));
 		if (call) {
 			if (compl == RXRPC_CALL_LOCALLY_ABORTED)
-				trace_rxrpc_abort("CON", call->cid,
+				trace_rxrpc_abort(call->debug_id,
+						  "CON", call->cid,
 						  call->call_id, 0,
 						  abort_code, error);
 			if (rxrpc_set_call_completion(call, compl,
@@ -229,6 +239,8 @@ static int rxrpc_abort_connection(struct rxrpc_connection *conn,
 		_debug("sendmsg failed: %d", ret);
 		return -EAGAIN;
 	}
+
+	conn->params.peer->last_tx_at = ktime_get_real();
 
 	_leave(" = 0");
 	return 0;
@@ -452,6 +464,7 @@ void rxrpc_process_connection(struct work_struct *work)
 		case -EKEYEXPIRED:
 		case -EKEYREJECTED:
 			goto protocol_error;
+		case -ENOMEM:
 		case -EAGAIN:
 			goto requeue_and_leave;
 		case -ECONNABORTED:

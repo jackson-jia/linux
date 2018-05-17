@@ -140,6 +140,7 @@ static int omap_device_build_from_dt(struct platform_device *pdev)
 	struct omap_device *od;
 	struct omap_hwmod *oh;
 	struct device_node *node = pdev->dev.of_node;
+	struct resource res;
 	const char *oh_name;
 	int oh_cnt, i, ret = 0;
 	bool device_active = false;
@@ -149,6 +150,10 @@ static int omap_device_build_from_dt(struct platform_device *pdev)
 		dev_dbg(&pdev->dev, "No 'hwmods' to build omap_device\n");
 		return -ENODEV;
 	}
+
+	/* Use ti-sysc driver instead of omap_device? */
+	if (!omap_hwmod_parse_module_range(NULL, node, &res))
+		return -ENODEV;
 
 	hwmods = kzalloc(sizeof(struct omap_hwmod *) * oh_cnt, GFP_KERNEL);
 	if (!hwmods) {
@@ -391,10 +396,8 @@ omap_device_copy_resources(struct omap_hwmod *oh,
 	const char *name;
 	int error, irq = 0;
 
-	if (!oh || !oh->od || !oh->od->pdev) {
-		error = -EINVAL;
-		goto error;
-	}
+	if (!oh || !oh->od || !oh->od->pdev)
+		return -EINVAL;
 
 	np = oh->od->pdev->dev.of_node;
 	if (!np) {
@@ -516,8 +519,10 @@ struct platform_device __init *omap_device_build(const char *pdev_name,
 		goto odbs_exit1;
 
 	od = omap_device_alloc(pdev, &oh, 1);
-	if (IS_ERR(od))
+	if (IS_ERR(od)) {
+		ret = PTR_ERR(od);
 		goto odbs_exit1;
+	}
 
 	ret = platform_device_add_data(pdev, pdata, pdata_len);
 	if (ret)

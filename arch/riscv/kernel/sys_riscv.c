@@ -24,8 +24,8 @@ static long riscv_sys_mmap(unsigned long addr, unsigned long len,
 {
 	if (unlikely(offset & (~PAGE_MASK >> page_shift_offset)))
 		return -EINVAL;
-	return sys_mmap_pgoff(addr, len, prot, flags, fd,
-			      offset >> (PAGE_SHIFT - page_shift_offset));
+	return ksys_mmap_pgoff(addr, len, prot, flags, fd,
+			       offset >> (PAGE_SHIFT - page_shift_offset));
 }
 
 #ifdef CONFIG_64BIT
@@ -70,7 +70,7 @@ SYSCALL_DEFINE3(riscv_flush_icache, uintptr_t, start, uintptr_t, end,
 	bool local = (flags & SYS_RISCV_FLUSH_ICACHE_LOCAL) != 0;
 
 	/* Check the reserved flags. */
-	if (unlikely(flags & !SYS_RISCV_FLUSH_ICACHE_ALL))
+	if (unlikely(flags & ~SYS_RISCV_FLUSH_ICACHE_ALL))
 		return -EINVAL;
 
 	flush_icache_mm(mm, local);
